@@ -1,5 +1,6 @@
 import 'dart:async';
 import 'dart:math';
+import 'dart:convert';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
@@ -7,9 +8,21 @@ import 'package:flutter/services.dart';
 import 'package:flutter_local_notifications/flutter_local_notifications.dart';
 import 'package:geolocator/geolocator.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:http/http.dart' as http;
 
 const String appLogo = 'assets/images/spendguard_logo.png';
 const String appIcon = 'assets/images/spendguard_icon.png';
+
+// REAL GPS STORE DETECTION
+// Create a Google Places API key, enable Places API, then paste it here.
+// If empty, SpendGuard uses the existing trial stores as fallback.
+const String googlePlacesApiKey = '';
+
+// REAL AI
+// Do NOT put an OpenAI API key inside the app.
+// Use a secure backend endpoint later and paste the endpoint URL here.
+// If empty, SpendGuard uses a smart local Future Self fallback.
+const String futureSelfAiEndpoint = '';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -92,6 +105,24 @@ class NotificationService {
     );
     const details = NotificationDetails(android: android);
     await plugin.show(1001, title, body, details);
+  }
+
+  static Future<void> showStoreDecision(StoreDecision decision, BudgetData budget) async {
+    final store = decision.store.name;
+    final dream = budget.dreamName.isEmpty ? 'your dream' : budget.dreamName;
+    final title = '${decision.store.riskLabel}: $store detected';
+    final body = decision.stop
+        ? 'Stop spending today. Protect $dream and reset tomorrow.'
+        : 'Safe here: €${decision.safeAmount.toStringAsFixed(2)}. Overspending could delay $dream by ${decision.delayDays} day(s).';
+    await show(title, body);
+  }
+
+  static Future<void> showDreamProgress(BudgetData budget) async {
+    if (!budget.hasDream) return;
+    await show(
+      'DreamGuard update',
+      '${budget.dreamName} is ${(budget.dreamProgress * 100).toStringAsFixed(0)}% protected. Dream Vault: €${budget.dreamVault.toStringAsFixed(0)}.',
+    );
   }
 }
 
@@ -296,7 +327,192 @@ const trialStores = [
     color: AppColors.red,
     advice: 'Electronics can delay your dream quickly.',
   ),
+
 ];
+
+class RealStoreService {
+  static bool get hasApiKey => googlePlacesApiKey.trim().isNotEmpty;
+
+  static Future<StoreInfo?> detectNearestStore(Position position) async {
+    if (!hasApiKey) {
+      return _fallbackTrialStore(position);
+    }
+
+    final uri = Uri.https(
+      'maps.googleapis.com',
+      '/maps/api/place/nearbysearch/json',
+      {
+        'location': '${position.latitude},${position.longitude}',
+        'radius': '85',
+        'type': 'store',
+        'key': googlePlacesApiKey,
+      },
+    );
+
+    try {
+      final response = await http.get(uri).timeout(const Duration(seconds: 8));
+      if (response.statusCode != 200) return _fallbackTrialStore(position);
+
+      final decoded = jsonDecode(response.body) as Map<String, dynamic>;
+      final results = (decoded['results'] as List?) ?? [];
+      if (results.isEmpty) return null;
+
+      Map<String, dynamic>? best;
+      double bestDistance = double.infinity;
+
+      for (final item in results.take(8)) {
+        final place = item as Map<String, dynamic>;
+        final geometry = place['geometry'] as Map<String, dynamic>?;
+        final location = geometry?['location'] as Map<String, dynamic>?;
+        if (location == null) continue;
+
+        final lat = (location['lat'] as num).toDouble();
+        final lng = (location['lng'] as num).toDouble();
+        final distance = Geolocator.distanceBetween(
+          position.latitude,
+          position.longitude,
+          lat,
+          lng,
+        );
+
+        if (distance < bestDistance) {
+          bestDistance = distance;
+          best = place;
+        }
+      }
+
+      if (best == null || bestDistance > 95) return null;
+
+      final geometry = best['geometry'] as Map<String, dynamic>;
+      final location = geometry['location'] as Map<String, dynamic>;
+      final types = ((best['types'] as List?) ?? []).map((e) => e.toString()).toList();
+      final name = (best['name'] ?? 'Nearby store').toString();
+
+      final category = _categoryFromTypes(name, types);
+      final risk = _riskForCategory(category);
+
+      return StoreInfo(
+        name: name,
+        category: category,
+        lat: (location['lat'] as num).toDouble(),
+        lng: (location['lng'] as num).toDouble(),
+        radius: 95,
+        risk: risk,
+        icon: _iconForCategory(category),
+        color: _colorForRisk(risk),
+        advice: _adviceForCategory(risk),
+      );
+    } catch (_) {
+      return _fallbackTrialStore(position);
+    }
+  }
+
+  static StoreInfo? _fallbackTrialStore(Position p) {
+    StoreInfo? best;
+    double bestDistance = double.infinity;
+    for (final s in trialStores) {
+      final d = Geolocator.distanceBetween(p.latitude, p.longitude, s.lat, s.lng);
+      if (d < bestDistance) {
+        bestDistance = d;
+        best = s;
+      }
+    }
+    if (best != null && bestDistance <= best.radius) return best;
+    return null;
+  }
+
+  static String _categoryFromTypes(String name, List<String> types) {
+    final n = name.toLowerCase();
+    if (types.contains('grocery_or_supermarket') || types.contains('supermarket') || n.contains('tesco') || n.contains('lidl') || n.contains('aldi')) return 'Groceries';
+    if (types.contains('clothing_store') || n.contains('zara') || n.contains('h&m') || n.contains('primark')) return 'Clothing';
+    if (types.contains('electronics_store') || n.contains('currys') || n.contains('apple') || n.contains('phone')) return 'Electronics';
+    if (types.contains('restaurant') || types.contains('cafe') || types.contains('meal_takeaway')) return 'Food & Coffee';
+    return 'Shopping';
+  }
+
+  static int _riskForCategory(String category) {
+    switch (category) {
+      case 'Groceries':
+        return 25;
+      case 'Food & Coffee':
+        return 45;
+      case 'Clothing':
+        return 62;
+      case 'Electronics':
+        return 86;
+      default:
+        return 55;
+    }
+  }
+
+  static IconData _iconForCategory(String category) {
+    switch (category) {
+      case 'Groceries':
+        return Icons.shopping_basket_rounded;
+      case 'Food & Coffee':
+        return Icons.restaurant_rounded;
+      case 'Clothing':
+        return Icons.checkroom_rounded;
+      case 'Electronics':
+        return Icons.devices_rounded;
+      default:
+        return Icons.storefront_rounded;
+    }
+  }
+
+  static Color _colorForRisk(int risk) {
+    if (risk >= 75) return AppColors.red;
+    if (risk >= 45) return AppColors.amber;
+    return AppColors.green;
+  }
+
+  static String _adviceForCategory(int risk) {
+    if (risk >= 75) return 'High impulse risk. Use SpendGuard Moment before buying.';
+    if (risk >= 45) return 'Caution. Delay non-essential purchases by 24 hours.';
+    return 'Low risk. Keep it planned and avoid impulse add-ons.';
+  }
+}
+
+class FutureSelfAiService {
+  static Future<String> generate({
+    required BudgetData budget,
+    StoreDecision? decision,
+    double? pendingAmount,
+    String mood = 'Neutral',
+  }) async {
+    final dream = budget.dreamName.isEmpty ? 'your dream' : budget.dreamName;
+    final amount = pendingAmount ?? decision?.safeAmount ?? 0;
+    final delay = budget.delayDaysFor(max(1, amount));
+    final fallback = 'Future you says: protect $dream. €${amount.toStringAsFixed(2)} today can mean about $delay dream day(s).';
+
+    if (futureSelfAiEndpoint.trim().isEmpty) return fallback;
+
+    try {
+      final response = await http.post(
+        Uri.parse(futureSelfAiEndpoint),
+        headers: {'Content-Type': 'application/json'},
+        body: jsonEncode({
+          'dreamName': dream,
+          'dreamProgress': budget.dreamProgress,
+          'dreamVault': budget.dreamVault,
+          'safeToday': budget.safeTodayAfterDream,
+          'store': decision?.store.name,
+          'risk': decision?.store.riskLabel,
+          'pendingAmount': amount,
+          'mood': mood,
+        }),
+      ).timeout(const Duration(seconds: 8));
+
+      if (response.statusCode < 200 || response.statusCode >= 300) return fallback;
+      final decoded = jsonDecode(response.body);
+      final message = decoded is Map ? decoded['message']?.toString() : null;
+      if (message == null || message.trim().isEmpty) return fallback;
+      return message.trim();
+    } catch (_) {
+      return fallback;
+    }
+  }
+}
 
 class StoreDecision {
   final StoreInfo store;
@@ -603,6 +819,7 @@ class _MainScreenState extends State<MainScreen> {
   String? lastNotifiedStore;
   final List<ActivityItem> activity = [];
   final List<SocialRequest> socialRequests = [];
+  String futureSelfMessage = 'Future you says: set one dream and let SpendGuard protect it.';
 
   @override
   void initState() {
@@ -624,6 +841,7 @@ class _MainScreenState extends State<MainScreen> {
       loading = false;
     });
     unawaited(checkLocation());
+    unawaited(refreshFutureSelf());
     if (widget.openSetup || !data.isReady) {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         if (mounted) _openQuickSetup();
@@ -655,6 +873,8 @@ class _MainScreenState extends State<MainScreen> {
         ),
       );
     });
+    await NotificationService.showDreamProgress(updated);
+    unawaited(refreshFutureSelf(amount: amount, mood: 'Protected'));
   }
 
   Future<void> createSocialRequest({
@@ -689,6 +909,17 @@ class _MainScreenState extends State<MainScreen> {
     });
   }
 
+  Future<void> refreshFutureSelf({StoreDecision? decision, double? amount, String mood = 'Neutral'}) async {
+    final message = await FutureSelfAiService.generate(
+      budget: budget,
+      decision: decision,
+      pendingAmount: amount,
+      mood: mood,
+    );
+    if (!mounted) return;
+    setState(() => futureSelfMessage = message);
+  }
+
   StoreDecision decisionFor(StoreInfo store) {
     if (!budget.isReady) {
       return StoreDecision(store: store, safeAmount: 0, delayDays: 0, stop: true);
@@ -713,22 +944,12 @@ class _MainScreenState extends State<MainScreen> {
     );
   }
 
-  StoreInfo? nearestStore(Position p) {
-    StoreInfo? best;
-    double bestDistance = double.infinity;
-    for (final s in trialStores) {
-      final d = Geolocator.distanceBetween(p.latitude, p.longitude, s.lat, s.lng);
-      if (d < bestDistance) {
-        bestDistance = d;
-        best = s;
-      }
-    }
-    if (best != null && bestDistance <= best.radius) return best;
-    return null;
+  Future<StoreInfo?> nearestStore(Position p) async {
+    return RealStoreService.detectNearestStore(p);
   }
 
   Future<void> handlePosition(Position position, {bool force = false}) async {
-    final store = nearestStore(position);
+    final store = await nearestStore(position);
     if (!mounted) return;
 
     if (store == null) {
@@ -762,7 +983,8 @@ class _MainScreenState extends State<MainScreen> {
 
     if (force || lastNotifiedStore != store.name) {
       lastNotifiedStore = store.name;
-      await NotificationService.show('SpendGuard detected ${store.name}', decision.message);
+      await NotificationService.showStoreDecision(decision, budget);
+      unawaited(refreshFutureSelf(decision: decision));
     }
   }
 
@@ -842,6 +1064,7 @@ class _MainScreenState extends State<MainScreen> {
         onGps: checkLocation,
         onSetup: _openQuickSetup,
         onProtectMoney: protectMoney,
+        futureSelfMessage: futureSelfMessage,
       ),
       DreamScreen(budget: budget, onSetup: _openQuickSetup),
       RadarScreen(
@@ -1037,6 +1260,7 @@ class HomeScreen extends StatelessWidget {
   final VoidCallback onGps;
   final VoidCallback onSetup;
   final Future<void> Function(double, String) onProtectMoney;
+  final String futureSelfMessage;
 
   const HomeScreen({
     super.key,
@@ -1049,6 +1273,7 @@ class HomeScreen extends StatelessWidget {
     required this.onGps,
     required this.onSetup,
     required this.onProtectMoney,
+    required this.futureSelfMessage,
   });
 
   @override
@@ -1131,9 +1356,7 @@ class HomeScreen extends StatelessWidget {
             ),
             const SizedBox(height: 14),
             FutureSelfCard(
-              message: budget.hasDream
-                  ? 'Future you says: ${budget.dreamName} is ${(budget.dreamProgress * 100).toStringAsFixed(0)}% protected. Keep today under control.'
-                  : 'Future you says: set one dream and let SpendGuard protect it.',
+              message: futureSelfMessage,
             ),
             const SizedBox(height: 14),
             ProtectionStreakCard(activity: activity),
